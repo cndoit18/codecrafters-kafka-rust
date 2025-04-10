@@ -22,20 +22,37 @@ fn main() {
                 stream.read_exact(msg.as_mut_slice()).unwrap();
                 dbg!(&msg);
 
-                let mut response = Vec::<u8>::new();
+                let mut message = Vec::<u8>::new();
                 let api_version = i16::from_be_bytes([msg[2], msg[3]]);
                 dbg!(&api_version);
                 match api_version {
                     0..=4 => {
-                        response.extend(&[0, 0, 0, 0]);
-                        response.extend(&msg[4..8]);
+                        // correlation id
+                        message.extend(&msg[4..8]);
+                        // error code
+                        message.extend(&[0, 0]);
+                        // num api key records + 1
+                        message.extend(&[2]);
+                        // api key
+                        message.extend(&[0, 18]);
+                        // nim version
+                        message.extend(&[0, 0]);
+                        // max version
+                        message.extend(&[0, 4]);
+                        // TAG_BUFFER length
+                        message.extend(&[0]);
+                        // throttle time ms
+                        message.extend(&[0, 0, 0, 0]);
+                        // TAG_BUFFER length
+                        message.extend(&[0]);
                     }
                     _ => {
-                        response.extend(&[0, 0, 0, 0]);
-                        response.extend(&msg[4..8]);
-                        response.extend(&[0, 0x23]);
+                        message.extend(&msg[4..8]);
+                        message.extend(&[0, 0x23]);
                     }
                 };
+                let mut response = (message.len() as u32).to_be_bytes().to_vec();
+                response.extend(&message);
                 stream.write_all(response.as_slice()).unwrap();
             }
             Err(e) => {
