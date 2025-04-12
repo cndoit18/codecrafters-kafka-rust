@@ -1,3 +1,4 @@
+use bytes::{Buf, BufMut};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -13,7 +14,7 @@ fn main() {
                     while let Ok(req) = Request::parse(&stream) {
                         dbg!(&req);
                         let mut message = Vec::<u8>::new();
-                        if !(1..=4).contains(&req.header.api_version) {
+                        if !(0..=4).contains(&req.header.api_version) {
                             message.extend(req.header.correlation_id.to_be_bytes());
                             message.extend(&[0, 0x23]);
                             let mut response = (message.len() as u32).to_be_bytes().to_vec();
@@ -25,42 +26,75 @@ fn main() {
                         match req.header.api_key {
                             // APIVersions
                             18 => {
-                                // correlation id
-                                message.extend(req.header.correlation_id.to_be_bytes());
-                                // error code
-                                message.extend(&[0, 0]);
-                                // num api key records + 1
-                                message.extend(&[3]);
-                                // api key
-                                message.extend(&[0, 18]);
-                                // nim version
-                                message.extend(&[0, 0]);
-                                // max version
-                                message.extend(&[0, 4]);
-                                // TAG_BUFFER length
-                                message.extend(&[0]);
+                                stream
+                                    .write_all(
+                                        Response {
+                                            correlation_id: req.header.correlation_id,
+                                            tag_buffer: 0,
+                                            message: ResponseMessage::APIVersions {
+                                                error_code: 0,
+                                                api_versions: vec![
+                                                    ResponseMessageAPIVersion {
+                                                        api_key: 18,
+                                                        min_supported_api_version: 0,
+                                                        max_supported_api_version: 4,
+                                                        tag_buffer: 0,
+                                                    },
+                                                    ResponseMessageAPIVersion {
+                                                        api_key: 75,
+                                                        min_supported_api_version: 0,
+                                                        max_supported_api_version: 0,
+                                                        tag_buffer: 0,
+                                                    },
+                                                ],
+                                                throttle_time: 0,
+                                                tag_buffer: 0,
+                                            },
+                                        }
+                                        .to_vec()
+                                        .as_slice(),
+                                    )
+                                    .unwrap();
+                            }
+                            75 => {
+                                let mut resp_topics = vec![];
+                                if let RequestMessage::DescribeTopicPartitions {
+                                    topics,
+                                    response_partition_limit: _,
+                                    cursor: _,
+                                    tag_buffer: _,
+                                } = req.message
+                                {
+                                    for RequestMessageTopic { name, tag_buffer } in topics {
+                                        resp_topics.push(ResponseMessageTopic {
+                                            error_code: 3,
+                                            topic_name: name,
+                                            topic_id: 0,
+                                            is_internal: 0,
+                                            authorize_operations: 0x0df8,
+                                            tag_buffer,
+                                        });
+                                    }
+                                }
 
-                                // api key
-                                message.extend(&[0, 75]);
-                                // nim version
-                                message.extend(&[0, 0]);
-                                // max version
-                                message.extend(&[0, 0]);
-                                // TAG_BUFFER length
-                                message.extend(&[0]);
-
-                                // throttle time ms
-                                message.extend(&[0, 0, 0, 0]);
-                                // TAG_BUFFER length
-                                message.extend(&[0]);
+                                let resp = Response {
+                                    correlation_id: req.header.correlation_id,
+                                    tag_buffer: req.header.tag_buffer,
+                                    message: ResponseMessage::DescribeTopicPartitions {
+                                        throttle_time: 0,
+                                        topics: resp_topics,
+                                        next_cursor: 0xff,
+                                        tag_buffer: 0,
+                                    },
+                                }
+                                .to_vec();
+                                dbg!(&resp);
+                                stream.write_all(resp.as_slice()).unwrap();
                             }
                             _ => {
                                 unimplemented!();
                             }
                         }
-                        let mut response = (message.len() as u32).to_be_bytes().to_vec();
-                        response.extend(&message);
-                        stream.write_all(response.as_slice()).unwrap();
                     }
                 });
             }
@@ -71,17 +105,133 @@ fn main() {
     }
 }
 
+#[derive(Debug)]
+struct Response {
+    correlation_id: i32,
+    tag_buffer: u8,
+    message: ResponseMessage,
+}
+
+impl Response {
+    fn to_vec(&self) -> Vec<u8> {
+        dbg!(&self);
+        let mut msg = vec![];
+        msg.put_i32(self.correlation_id);
+        msg.put_u8(self.tag_buffer);
+        self.message.append(&mut msg);
+        let mut response = (msg.len() as u32).to_be_bytes().to_vec();
+        response.extend(&msg);
+        response
+    }
+}
+
+impl ResponseMessage {
+    fn append(&self, msg: &mut Vec<u8>) {
+        match self {
+            ResponseMessage::DescribeTopicPartitions {
+                throttle_time,
+                topics,
+                next_cursor,
+                tag_buffer,
+            } => {
+                msg.put_u32(*throttle_time);
+                msg.put_u8(topics.len() as u8 + 1);
+                for ResponseMessageTopic {
+                    error_code,
+                    topic_name,
+                    topic_id,
+                    is_internal,
+                    authorize_operations,
+                    tag_buffer,
+                } in topics
+                {
+                    msg.put_u16(*error_code);
+                    msg.put_u8(topic_name.len() as u8 + 1);
+                    msg.put_slice(topic_name.as_bytes());
+                    msg.put_u128(*topic_id);
+                    msg.put_u8(*is_internal);
+                    msg.put_u8(1);
+                    msg.put_u32(*authorize_operations);
+                    msg.put_u8(*tag_buffer);
+                }
+                msg.put_u8(*next_cursor);
+                msg.put_u8(*tag_buffer);
+            }
+            ResponseMessage::APIVersions {
+                error_code,
+                api_versions,
+                throttle_time,
+                tag_buffer,
+            } => {
+                msg.put_u8(*error_code);
+                msg.put_u8(api_versions.len() as u8 + 1);
+                for ResponseMessageAPIVersion {
+                    api_key,
+                    min_supported_api_version,
+                    max_supported_api_version,
+                    tag_buffer,
+                } in api_versions
+                {
+                    msg.put_i16(*api_key);
+                    msg.put_u16(*min_supported_api_version);
+                    msg.put_u16(*max_supported_api_version);
+                    msg.put_u8(*tag_buffer);
+                }
+                msg.put_u32(*throttle_time);
+                msg.put_u8(*tag_buffer);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResponseMessage {
+    DescribeTopicPartitions {
+        throttle_time: u32,
+        topics: Vec<ResponseMessageTopic>,
+        next_cursor: u8,
+        tag_buffer: u8,
+    },
+    APIVersions {
+        error_code: u8,
+        api_versions: Vec<ResponseMessageAPIVersion>,
+        throttle_time: u32,
+        tag_buffer: u8,
+    },
+}
+
+#[derive(Debug)]
+struct ResponseMessageAPIVersion {
+    api_key: i16,
+    min_supported_api_version: u16,
+    max_supported_api_version: u16,
+    tag_buffer: u8,
+}
+
+#[derive(Debug)]
+struct ResponseMessageTopic {
+    error_code: u16,
+    topic_name: String,
+    topic_id: u128,
+    is_internal: u8,
+    // ignore partitions
+    authorize_operations: u32,
+    tag_buffer: u8,
+}
+
 #[derive(Default, Debug)]
-struct Header {
+struct RequestHeader {
     api_key: i16,
     api_version: i16,
     correlation_id: i32,
     client_id: String,
+    tag_buffer: u8,
 }
 
 #[derive(Debug)]
 struct Request {
-    header: Header,
+    header: RequestHeader,
+    message: RequestMessage,
 }
 
 impl Request {
@@ -90,17 +240,76 @@ impl Request {
         stream.read_exact(&mut buf).map_err(|err| err.to_string())?;
         let mut msg = vec![0_u8; u32::from_be_bytes(buf) as usize];
         stream.read_exact(&mut msg).map_err(|err| err.to_string())?;
-        let mut req = Request {
-            header: Header::default(),
-        };
-        req.header.api_key = i16::from_be_bytes([msg[0], msg[1]]);
-        req.header.api_version = i16::from_be_bytes([msg[2], msg[3]]);
-        req.header.correlation_id = i32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]);
-        req.header.client_id =
-            String::from_utf8(msg[10..10 + i16::from_be_bytes([msg[8], msg[9]]) as usize].to_vec())
-                .map_err(|err| err.to_string())?;
+        let mut msg = msg.as_slice();
+        let mut header = RequestHeader::default();
 
-        Ok(req)
+        header.api_key = msg.get_i16();
+        header.api_version = msg.get_i16();
+        header.correlation_id = msg.get_i32();
+        let mut client_id = vec![0_u8; msg.get_i16() as usize];
+        msg.read_exact(&mut client_id)
+            .map_err(|err| err.to_string())?;
+        header.client_id = String::from_utf8(client_id).map_err(|err| err.to_string())?;
+        header.tag_buffer = msg.get_u8();
+
+        let message = match header.api_key {
+            75 => {
+                let mut topics =
+                    Vec::<RequestMessageTopic>::with_capacity(msg.get_u8() as usize - 1);
+                for _i in 0..topics.capacity() {
+                    let mut name = vec![0_u8; msg.get_u8() as usize - 1];
+                    msg.read_exact(&mut name).map_err(|err| err.to_string())?;
+                    topics.push(RequestMessageTopic {
+                        name: String::from_utf8(name).map_err(|err| err.to_string())?,
+                        tag_buffer: msg.get_u8(),
+                    });
+                }
+                RequestMessage::DescribeTopicPartitions {
+                    topics,
+                    response_partition_limit: msg.get_u32(),
+                    cursor: msg.get_u8(),
+                    tag_buffer: msg.get_u8(),
+                }
+            }
+            18 => {
+                let mut s = vec![0_u8; msg.get_u8() as usize - 1];
+                msg.read_exact(&mut s).map_err(|err| err.to_string())?;
+                let client_id = String::from_utf8(s).map_err(|err| err.to_string())?;
+
+                let mut s = vec![0_u8; msg.get_u8() as usize - 1];
+                msg.read_exact(&mut s).map_err(|err| err.to_string())?;
+                let client_version = String::from_utf8(s).map_err(|err| err.to_string())?;
+                RequestMessage::APIVersions {
+                    client_id,
+                    client_version,
+                    tag_buffer: msg.get_u8(),
+                }
+            }
+            _ => unimplemented!(),
+        };
+
+        Ok(Request { header, message })
     }
 }
-enum Message {}
+
+#[derive(Debug)]
+#[allow(unused)]
+enum RequestMessage {
+    DescribeTopicPartitions {
+        topics: Vec<RequestMessageTopic>,
+        response_partition_limit: u32,
+        cursor: u8,
+        tag_buffer: u8,
+    },
+    APIVersions {
+        client_id: String,
+        client_version: String,
+        tag_buffer: u8,
+    },
+}
+
+#[derive(Debug)]
+struct RequestMessageTopic {
+    name: String,
+    tag_buffer: u8,
+}
