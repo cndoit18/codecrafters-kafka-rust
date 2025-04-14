@@ -1,4 +1,5 @@
 use bytes::{Buf, BufMut};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::thread;
@@ -254,6 +255,12 @@ impl Request {
 
         let message = match header.api_key {
             75 => {
+                let mut f = File::open(
+                    "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log",
+                )
+                .map_err(|err| err.to_string())?;
+                let mut metadata = ClusterMetadata::parse(f)?;
+                dbg!(&metadata);
                 let mut topics =
                     Vec::<RequestMessageTopic>::with_capacity(msg.get_u8() as usize - 1);
                 for _i in 0..topics.capacity() {
@@ -312,4 +319,86 @@ enum RequestMessage {
 struct RequestMessageTopic {
     name: String,
     tag_buffer: u8,
+}
+
+#[derive(Debug)]
+struct ClusterMetadata {
+    offset: u64,
+    partition_leader_epoch: u32,
+    magic: u8,
+    crc: u32,
+    attributes: u16,
+    last_offset_delta: u32,
+    base_timestamp: u64,
+    max_timestamp: u64,
+    producer_id: i64,
+    producer_epoch: i16,
+    base_sequence: i32,
+    records: Vec<Record>,
+}
+
+#[derive(Debug)]
+struct Record {
+    attributes: u8,
+    timestamp_dalta: i8,
+    offset_dalta: i8,
+}
+
+impl ClusterMetadata {
+    fn parse<R: Read>(mut stream: R) -> Result<Self, String> {
+        let mut offset = [0_u8; 8];
+        stream
+            .read_exact(&mut offset)
+            .map_err(|err| err.to_string())?;
+        let mut size = [0_u8; 4];
+        stream
+            .read_exact(&mut size)
+            .map_err(|err| err.to_string())?;
+        let mut raw = vec![0_u8; u32::from_be_bytes(size) as usize];
+        stream.read_exact(&mut raw).map_err(|err| err.to_string())?;
+        let mut msg = raw.as_slice();
+        let offset = u64::from_be_bytes(offset);
+        let partition_leader_epoch = msg.get_u32();
+        let magic = msg.get_u8();
+        let crc = msg.get_u32();
+        let attributes = msg.get_u16();
+        let last_offset_delta = msg.get_u32();
+        let base_timestamp = msg.get_u64();
+        let max_timestamp = msg.get_u64();
+        let producer_id = msg.get_i64();
+        let producer_epoch = msg.get_i16();
+        let base_sequence = msg.get_i32();
+        let records_size = msg.get_u32();
+        let mut records = vec![];
+        for _i in 0..records_size {
+            let size = msg.get_i8() as i16;
+            let size = ((size >> 1) ^ -(size & 1)) as i8;
+            let mut buf = vec![0_u8; size as usize];
+            msg.read_exact(&mut buf).map_err(|err| err.to_string())?;
+            let mut buf = buf.as_slice();
+            let attributes = buf.get_u8();
+            let timestamp_dalta = buf.get_i8();
+            let offset_dalta = buf.get_i8();
+            let _key_length = buf.get_i8();
+            records.push(Record {
+                attributes,
+                timestamp_dalta,
+                offset_dalta,
+            })
+        }
+        Ok(ClusterMetadata {
+            offset,
+            partition_leader_epoch,
+            magic,
+            crc,
+            attributes,
+            last_offset_delta,
+            base_timestamp,
+            max_timestamp,
+            producer_id,
+            producer_epoch,
+            base_sequence,
+            records,
+        })
+    }
 }
