@@ -1,6 +1,6 @@
 use bytes::{Buf, BufMut};
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::net::TcpListener;
 use std::thread;
 
@@ -255,11 +255,19 @@ impl Request {
 
         let message = match header.api_key {
             75 => {
-                let mut f = File::open(
+                let mut reader = vec![];
+                let _ = File::open(
                     "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log",
                 )
+                .map_err(|err| err.to_string())?
+                .read_to_end(&mut reader)
                 .map_err(|err| err.to_string())?;
-                let mut metadata = ClusterMetadata::parse(f)?;
+                let mut metadata = vec![];
+                let mut reader = Cursor::new(reader.to_vec());
+                while reader.remaining() > 0 {
+                    dbg!(reader.remaining());
+                    metadata.push(ClusterMetadata::parse(&mut reader)?);
+                }
                 dbg!(&metadata);
                 let mut topics =
                     Vec::<RequestMessageTopic>::with_capacity(msg.get_u8() as usize - 1);
@@ -371,8 +379,10 @@ impl ClusterMetadata {
         let records_size = msg.get_u32();
         let mut records = vec![];
         for _i in 0..records_size {
-            let size = msg.get_i8() as i16;
-            let size = ((size >> 1) ^ -(size & 1)) as i8;
+            let size = msg.get_u8();
+            // https://kafka.apache.org/protocol.html
+            // zig-zag encoding
+            let size = (size >> 1) ^ (!(size & 1) + 1);
             let mut buf = vec![0_u8; size as usize];
             msg.read_exact(&mut buf).map_err(|err| err.to_string())?;
             let mut buf = buf.as_slice();
@@ -380,11 +390,34 @@ impl ClusterMetadata {
             let timestamp_dalta = buf.get_i8();
             let offset_dalta = buf.get_i8();
             let _key_length = buf.get_i8();
+
+            let size = buf.get_u8();
+            // zig-zag encoding
+            let size = (size >> 1) ^ (!(size & 1) + 1);
+            dbg!(&size);
+            let mut value = vec![0_u8; size as usize];
+            buf.read_exact(&mut value).map_err(|err| err.to_string())?;
+            //let mut value = value.as_slice();
+            //
+            //let mut rv = RecordValue {
+            //    frame_version: value.get_u8(),
+            //    frame_type: value.get_u8(),
+            //    version: value.get_u8(),
+            //    name: String::new(),
+            //    feature_level: 0,
+            //};
+            //
+            //let name_length = value.get_u8() - 1;
+            //let mut name = vec![0_u8; name_length as usize];
+            //value.read_exact(&mut name).map_err(|err| err.to_string())?;
+            //rv.name = String::from_utf8(name).map_err(|err| err.to_string())?;
+            ////rv.feature_level = value.get_u16();
+            //let _ = value.get_u8();
             records.push(Record {
                 attributes,
                 timestamp_dalta,
                 offset_dalta,
-            })
+            });
         }
         Ok(ClusterMetadata {
             offset,
@@ -401,4 +434,13 @@ impl ClusterMetadata {
             records,
         })
     }
+}
+
+#[derive(Debug)]
+struct RecordValue {
+    frame_version: u8,
+    frame_type: u8,
+    version: u8,
+    name: String,
+    feature_level: u16,
 }
